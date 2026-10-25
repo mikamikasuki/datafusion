@@ -46,9 +46,11 @@ use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::utils::memory::RecordBatchMemoryCounter;
 use datafusion_common::utils::{evaluate_partition_ranges, transpose};
 use datafusion_common::{Result, assert_eq_or_internal_err};
 use datafusion_execution::TaskContext;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_physical_expr_common::sort_expr::{
     OrderingRequirements, PhysicalSortExpr,
 };
@@ -307,6 +309,8 @@ impl ExecutionPlan for WindowAggExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let reservation = MemoryConsumer::new(format!("WindowAggExec[{partition}]"))
+            .register(context.memory_pool());
         let input = self.input.execute(partition, context)?;
         let stream = Box::pin(WindowAggStream::new(
             Arc::clone(&self.schema),
@@ -315,6 +319,7 @@ impl ExecutionPlan for WindowAggExec {
             BaselineMetrics::new(&self.metrics, partition),
             self.partition_by_sort_keys()?,
             self.ordered_partition_by_indices.clone(),
+            reservation,
         )?);
         Ok(stream)
     }
@@ -508,6 +513,8 @@ pub struct WindowAggStream {
     partition_by_sort_keys: Vec<PhysicalSortExpr>,
     baseline_metrics: BaselineMetrics,
     ordered_partition_by_indices: Vec<usize>,
+    memory_reservation: MemoryReservation,
+    input_memory_counter: RecordBatchMemoryCounter,
 }
 
 impl WindowAggStream {
@@ -519,6 +526,7 @@ impl WindowAggStream {
         baseline_metrics: BaselineMetrics,
         partition_by_sort_keys: Vec<PhysicalSortExpr>,
         ordered_partition_by_indices: Vec<usize>,
+        memory_reservation: MemoryReservation,
     ) -> Result<Self> {
         // In WindowAggExec all partition by columns should be ordered.
         assert_eq_or_internal_err!(
@@ -535,6 +543,8 @@ impl WindowAggStream {
             baseline_metrics,
             partition_by_sort_keys,
             ordered_partition_by_indices,
+            memory_reservation,
+            input_memory_counter: RecordBatchMemoryCounter::new(),
         })
     }
 
@@ -569,6 +579,19 @@ impl WindowAggStream {
             .map(|elems| concat(&elems.iter().map(|x| x.as_ref()).collect::<Vec<_>>()))
             .collect::<Result<Vec<ArrayRef>, ArrowError>>()?;
 
+        // Reserve the window result buffers before handing them downstream.
+        // The input-size allowance is reserved before evaluation; grow further
+        // here if a window result is larger than the buffered input.
+        let mut result_memory = RecordBatchMemoryCounter::new();
+        for column in &columns {
+            result_memory.count_array(column.as_ref());
+        }
+        self.memory_reservation.try_grow(
+            result_memory
+                .memory_usage()
+                .saturating_sub(self.input_memory_counter.memory_usage()),
+        )?;
+
         // combine with the original cols
         // note the setup of window aggregates is that they newly calculated window
         // expression results are always appended to the columns
@@ -579,6 +602,14 @@ impl WindowAggStream {
             Arc::clone(&self.schema),
             batch_columns,
         )?))
+    }
+
+    fn reserve_input_concat(&self) -> Result<()> {
+        // concat_batches materializes another input-sized copy while the
+        // original batches remain alive. Reserve an additional input-sized
+        // allowance for the window results before computing them.
+        self.memory_reservation
+            .try_grow(self.input_memory_counter.memory_usage().saturating_mul(2))
     }
 }
 
@@ -607,6 +638,8 @@ impl WindowAggStream {
         loop {
             return Poll::Ready(Some(match ready!(self.input.poll_next_unpin(cx)) {
                 Some(Ok(batch)) => {
+                    let additional_memory = self.input_memory_counter.count_batch(&batch);
+                    self.memory_reservation.try_grow(additional_memory)?;
                     self.batches.push(batch);
                     continue;
                 }
@@ -616,10 +649,13 @@ impl WindowAggStream {
                     // the final aggregates.
                     let input_schema = self.input.schema();
                     self.input = Box::pin(EmptyRecordBatchStream::new(input_schema));
+                    self.reserve_input_concat()?;
                     let Some(result) = self.compute_aggregates()? else {
                         return Poll::Ready(None);
                     };
                     self.finished = true;
+                    self.batches.clear();
+                    self.memory_reservation.free();
                     // Empty record batches should not be emitted.
                     // They need to be treated as  [`Option<RecordBatch>`]es and handled separately
                     debug_assert!(result.num_rows() > 0);

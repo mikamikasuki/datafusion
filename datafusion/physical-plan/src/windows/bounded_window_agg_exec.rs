@@ -51,6 +51,7 @@ use arrow::{
 use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::utils::memory::RecordBatchMemoryCounter;
 use datafusion_common::utils::{
     evaluate_partition_ranges, get_at_indices, get_row_at_idx,
 };
@@ -58,6 +59,7 @@ use datafusion_common::{
     HashMap, Result, ScalarValue, arrow_datafusion_err, exec_datafusion_err, exec_err,
 };
 use datafusion_execution::TaskContext;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_expr::ColumnarValue;
 use datafusion_expr::window_state::{PartitionBatchState, WindowAggState};
 use datafusion_physical_expr::window::{
@@ -513,6 +515,9 @@ impl ExecutionPlan for BoundedWindowAggExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let reservation =
+            MemoryConsumer::new(format!("BoundedWindowAggExec[{partition}]"))
+                .register(context.memory_pool());
         let input = self.input.execute(partition, context)?;
         let search_mode = self.get_search_algo()?;
         let stream = Box::pin(BoundedWindowAggStream::new(
@@ -523,6 +528,7 @@ impl ExecutionPlan for BoundedWindowAggExec {
             search_mode,
             partition,
             self.state_observer.clone(),
+            reservation,
         )?);
         Ok(stream)
     }
@@ -1219,6 +1225,7 @@ pub struct BoundedWindowAggStream {
     /// finalized per-window-expression state for every partition key that is
     /// about to be dropped.
     state_observer: Option<Arc<dyn WindowStateObserver>>,
+    memory_reservation: MemoryReservation,
 }
 
 impl BoundedWindowAggStream {
@@ -1288,6 +1295,7 @@ impl Stream for BoundedWindowAggStream {
 
 impl BoundedWindowAggStream {
     /// Create a new BoundedWindowAggStream
+    #[expect(clippy::too_many_arguments)]
     fn new(
         schema: SchemaRef,
         window_expr: Vec<Arc<dyn WindowExpr>>,
@@ -1296,6 +1304,7 @@ impl BoundedWindowAggStream {
         search_mode: Box<dyn PartitionSearcher>,
         partition_idx: usize,
         state_observer: Option<Arc<dyn WindowStateObserver>>,
+        memory_reservation: MemoryReservation,
     ) -> Result<Self> {
         let state = window_expr.iter().map(|_| IndexMap::default()).collect();
         let empty_batch = RecordBatch::new_empty(Arc::clone(&schema));
@@ -1312,7 +1321,28 @@ impl BoundedWindowAggStream {
             most_recent_row: None,
             partition_idx,
             state_observer,
+            memory_reservation,
         })
+    }
+
+    /// Returns the unique Arrow buffers retained by the input and window
+    /// state. The input buffer, per-partition buffers, and most-recent row can
+    /// share allocations, so count them through one counter.
+    fn retained_memory_size(&self) -> usize {
+        let mut counter = RecordBatchMemoryCounter::new();
+        counter.count_batch(&self.input_buffer);
+        for state in self.partition_buffers.values() {
+            counter.count_batch(&state.record_batch);
+        }
+        if let Some(row) = &self.most_recent_row {
+            counter.count_batch(row);
+        }
+        for expr_states in &self.window_agg_states {
+            for state in expr_states.values() {
+                counter.count_array(state.state.out_col.as_ref());
+            }
+        }
+        counter.memory_usage()
     }
 
     fn compute_aggregates(&mut self) -> Result<Option<RecordBatch>> {
@@ -1378,6 +1408,16 @@ impl BoundedWindowAggStream {
                 // stopped when dropped.
                 let _timer = elapsed_compute.timer();
 
+                // Partition updates concatenate retained batches. Reserve room
+                // for the existing state plus the incoming batch before those
+                // allocations happen; after evaluation/pruning, shrink back to
+                // the buffers still owned by this stream.
+                let retained = self.retained_memory_size();
+                let mut counter = RecordBatchMemoryCounter::new();
+                let incoming = counter.count_batch(&batch);
+                self.memory_reservation
+                    .try_resize(retained.saturating_add(incoming).saturating_mul(2))?;
+
                 if self.search_mode.is_mode_linear() && batch.num_rows() > 0 {
                     self.most_recent_row = Some(get_last_row_batch(&batch)?);
                 }
@@ -1387,7 +1427,15 @@ impl BoundedWindowAggStream {
                     &self.window_expr,
                     &mut self.partition_buffers,
                 )?;
-                if let Some(batch) = self.compute_aggregates()? {
+                // Stateful evaluation may materialize output columns before
+                // pruning them. Reserve an additional retained-state-sized
+                // allowance before those buffers are created.
+                self.memory_reservation
+                    .try_resize(self.retained_memory_size().saturating_mul(2))?;
+                let output = self.compute_aggregates()?;
+                self.memory_reservation
+                    .try_resize(self.retained_memory_size())?;
+                if let Some(batch) = output {
                     return Poll::Ready(Some(Ok(batch)));
                 }
                 self.poll_next_inner(cx)
@@ -1404,7 +1452,12 @@ impl BoundedWindowAggStream {
                 for (_, partition_batch_state) in self.partition_buffers.iter_mut() {
                     partition_batch_state.is_end = true;
                 }
-                if let Some(batch) = self.compute_aggregates()? {
+                self.memory_reservation
+                    .try_resize(self.retained_memory_size().saturating_mul(2))?;
+                let output = self.compute_aggregates()?;
+                self.memory_reservation
+                    .try_resize(self.retained_memory_size())?;
+                if let Some(batch) = output {
                     return Poll::Ready(Some(Ok(batch)));
                 }
                 Poll::Ready(None)

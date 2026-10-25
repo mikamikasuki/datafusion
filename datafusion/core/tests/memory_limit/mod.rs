@@ -133,6 +133,29 @@ async fn group_by_hash() {
         .await
 }
 
+#[tokio::test]
+async fn window_agg_respects_memory_limit() {
+    TestCase::new()
+        .with_query("select sum(v) over () from generate_series(1, 1000000) as t(v)")
+        .with_expected_errors(["Resources exhausted"])
+        .with_memory_limit(256 * 1024)
+        .run()
+        .await
+}
+
+#[tokio::test]
+async fn bounded_window_agg_respects_memory_limit() {
+    TestCase::new()
+        .with_query(
+            "select sum(v) over (order by v rows between current row and 200000 following) \
+             from generate_series(1, 1000000) as t(v)",
+        )
+        .with_expected_errors(["Resources exhausted"])
+        .with_memory_limit(256 * 1024)
+        .run()
+        .await
+}
+
 /// With `force_hash_collisions` every key hashes alike, so the hash
 /// repartitioning sends all groups to a single final stage, whose table then
 /// does not fit the limit however well memory is released. The limit is sized
