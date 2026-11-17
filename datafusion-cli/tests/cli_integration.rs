@@ -622,6 +622,62 @@ fn test_cli_format<'a>(#[case] format: &'a str) {
     assert_cmd_snapshot!(cmd);
 }
 
+#[test]
+fn test_cli_timestamp_tz_format_from_sql() {
+    let output = cli()
+        .args([
+            "-q",
+            "--command",
+            "SET datafusion.format.timestamp_tz_format = '%+'; \
+             SELECT arrow_cast(\
+                 '1970-01-01T00:00:00Z', \
+                 'Timestamp(Nanosecond, Some(\"UTC\"))'\
+             )",
+        ])
+        .output()
+        .expect("failed to run datafusion-cli with a timezone-aware format");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "CLI command failed, stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("1970-01-01T00:00:00+00:00"),
+        "expected the SQL setting to reach CLI timestamp rendering, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_cli_rejects_invalid_timestamp_tz_format_before_query_output() {
+    let output = cli()
+        .args([
+            "-q",
+            "--command",
+            "SET datafusion.format.timestamp_tz_format = '%'; \
+             SELECT arrow_cast(\
+                 '1970-01-01T00:00:00Z', \
+                 'Timestamp(Nanosecond, Some(\"UTC\"))'\
+             )",
+        ])
+        .output()
+        .expect("failed to run datafusion-cli with an invalid temporal format");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !output.status.success(),
+        "expected an invalid format to fail before the query, stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("datafusion.format.timestamp_tz_format"),
+        "expected a named format error, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("1970-01-01"),
+        "invalid settings must not produce query output, got:\n{stdout}"
+    );
+}
+
 #[rstest]
 #[case("no_track", ["--top-memory-consumers", "0"])]
 #[case("top2", ["--top-memory-consumers", "2"])]
